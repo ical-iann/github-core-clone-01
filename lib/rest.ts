@@ -569,8 +569,9 @@ function handleRepoRoutes(res: ServerResponse, ctx: Ctx, rest: string[]): boolea
       const list: { sha: string; obj: GitObject }[] = [];
       const seen = new Set<string>();
       const queue: string[] = [tip];
-      while (queue.length) {
-        const oid = queue.shift()!;
+      let head = 0;
+      while (head < queue.length) {
+        const oid = queue[head++]!;
         if (seen.has(oid)) continue;
         seen.add(oid);
         const obj = getObject(oid);

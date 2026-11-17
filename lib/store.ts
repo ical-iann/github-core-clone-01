@@ -62,6 +62,15 @@ export function putObject(type: ObjectType, data: Buffer): string {
   return oid;
 }
 
+/**
+ * Store an object whose oid is already known (a pack reader computed it):
+ * same as putObject but without hashing the data a second time.
+ */
+export function putObjectKnown(oid: string, type: ObjectType, data: Buffer): string {
+  if (!objects.has(oid)) objects.set(oid, { type, data });
+  return oid;
+}
+
 export function getObject(oid: string): GitObject | undefined {
   return objects.get(oid);
 }

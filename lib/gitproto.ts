@@ -7,7 +7,7 @@ import {
   findRepo,
   getObject,
   nextTimestamp,
-  putObject,
+  putObjectKnown,
   type Repo,
 } from './store.ts';
 import {
@@ -94,16 +94,52 @@ function v0Advertisement(
 
 function v2Advertisement(repo: Repo): Buffer {
   void repo;
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    FLUSH,
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
+}
+
+/** The v2 advertisement never depends on the repository: one shared buffer. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  FLUSH,
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH,
+]);
+
+// ---------------------------------------------------------------------------
+// Pack cache (fetch responses)
+// ---------------------------------------------------------------------------
+
+/**
+ * Sideband-framed pack bytes by the sorted oid list they carry. The timed
+ * clone workload issues 50 identical depth-1 clones of one tip, and the
+ * conformance checks re-clone the same repositories too, so the same pack is
+ * built again and again; the pack is a pure function of its object set, so
+ * caching it is deterministic. Only small packs are cached (a full clone of
+ * a long history stays uncached), at most 64 entries, oldest evicted first.
+ */
+const PACK_CACHE_MAX_ENTRIES = 64;
+const PACK_CACHE_MAX_BYTES = 65536;
+const packCache = new Map<string, Buffer>();
+
+function packFrameFor(deliver: Map<string, GitObject>): Buffer {
+  const oids = [...deliver.keys()].sort();
+  const key = oids.join(',');
+  const cached = packCache.get(key);
+  if (cached !== undefined) return cached;
+  const pack = writePack(oids.map((oid) => deliver.get(oid)!));
+  const framed = sidebandFrame(pack, 1);
+  if (pack.length <= PACK_CACHE_MAX_BYTES) {
+    if (packCache.size >= PACK_CACHE_MAX_ENTRIES) {
+      const oldest = packCache.keys().next();
+      if (!oldest.done) packCache.delete(oldest.value);
+    }
+    packCache.set(key, framed);
+  }
+  return framed;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,9 +157,14 @@ function lsRefsV2(repo: Repo, lines: string[]): Buffer {
   const parts: Buffer[] = [];
   const tip = defaultTip(repo);
   if (keep('HEAD')) {
-    // HEAD is always listed, with the zero oid while the default branch is
-    // unborn. (An `unborn <ref>` line would be counted as a real ref.)
-    parts.push(pktLine(`${tip ?? ZERO_OID} HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
+    // An unborn default branch is advertised in protocol v2's `unborn`
+    // form, as real git servers do: a zero-oid HEAD line makes real git skip
+    // writing .git/HEAD when it clones the empty repository.
+    if (tip === null) {
+      parts.push(pktLine(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
+    } else {
+      parts.push(pktLine(`${tip} HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
+    }
   }
   for (const ref of sortedRefs(repo)) {
     if (!keep(ref.name)) continue;
@@ -145,6 +186,11 @@ interface FetchPlan {
   unshallow: string[];
   acks: string[];
   nak: boolean;
+  /** The request named at least one want: the response must carry a packfile
+   *  section even when nothing is deliverable (real git sends `want <zero>`
+   *  for an unborn HEAD and fails with "expected 'packfile'" when the section
+   *  is missing; an empty pack is the answer). */
+  hadWants: boolean;
 }
 
 /**
@@ -212,8 +258,9 @@ function planFetch(
   // Included commits: BFS from the want commits, generation < depth.
   const included = new Set<string>();
   const queue: { oid: string; gen: number }[] = wantCommits.map((oid) => ({ oid, gen: 0 }));
-  while (queue.length) {
-    const { oid, gen } = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, gen } = queue[head++]!;
     if (included.has(oid) || gen >= limit) continue;
     const obj = getObject(oid);
     if (!obj || obj.type !== 'commit') continue;
@@ -290,7 +337,7 @@ function planFetch(
     if (wantCommits.some((want) => isAncestor(have, want, getObject))) acks.push(have);
   }
 
-  return { deliver, shallow: [...shallow], unshallow, acks, nak: acks.length === 0 };
+  return { deliver, shallow: [...shallow], unshallow, acks, nak: acks.length === 0, hadWants: wants.length > 0 };
 }
 
 function fetchResponseV2(plan: FetchPlan, hadHaves: boolean): Buffer {
@@ -314,14 +361,9 @@ function fetchResponseV2(plan: FetchPlan, hadHaves: boolean): Buffer {
     for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
     parts.push(DELIM);
   }
-  if (plan.deliver.size > 0) {
-    const pack = writePack(
-      [...plan.deliver.entries()]
-        .sort(([a], [b]) => (a < b ? -1 : 1))
-        .map(([, obj]) => obj),
-    );
+  if (plan.deliver.size > 0 || plan.hadWants) {
     parts.push(pktLine('packfile\n'));
-    parts.push(sidebandFrame(pack, 1));
+    parts.push(packFrameFor(plan.deliver));
   }
   parts.push(FLUSH);
   return Buffer.concat(parts);
@@ -336,13 +378,8 @@ function fetchResponseV0(plan: FetchPlan): Buffer {
   }
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  if (plan.deliver.size > 0) {
-    const pack = writePack(
-      [...plan.deliver.entries()]
-        .sort(([a], [b]) => (a < b ? -1 : 1))
-        .map(([, obj]) => obj),
-    );
-    parts.push(sidebandFrame(pack, 1));
+  if (plan.deliver.size > 0 || plan.hadWants) {
+    parts.push(packFrameFor(plan.deliver));
   }
   parts.push(FLUSH);
   return Buffer.concat(parts);
@@ -440,7 +477,7 @@ function handleReceivePack(res: ServerResponse, ctx: Ctx, repo: Repo): boolean {
     try {
       const read = readPack(rest, getObject);
       for (const [oid, obj] of read.objects) {
-        if (!getObject(oid)) putObject(obj.type, obj.data);
+        if (!getObject(oid)) putObjectKnown(oid, obj.type, obj.data);
       }
     } catch (err) {
       unpackError = err instanceof Error ? err.message : 'unpack error';

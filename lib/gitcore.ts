@@ -256,17 +256,19 @@ export function mergeBase(
   if (a === b) return a;
   const ancestorsA = new Set<string>();
   const queueA: string[] = [a];
-  while (queueA.length) {
-    const oid = queueA.shift()!;
+  let headA = 0;
+  while (headA < queueA.length) {
+    const oid = queueA[headA++]!;
     if (ancestorsA.has(oid)) continue;
     ancestorsA.add(oid);
     const obj = lookup(oid);
     if (obj?.type === 'commit') queueA.push(...parseCommit(obj.data).parents);
   }
   const queueB: string[] = [b];
+  let headB = 0;
   const seenB = new Set<string>();
-  while (queueB.length) {
-    const oid = queueB.shift()!;
+  while (headB < queueB.length) {
+    const oid = queueB[headB++]!;
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     if (ancestorsA.has(oid)) return oid;
@@ -284,8 +286,9 @@ export function commitList(
   const out: string[] = [];
   const seen = new Set<string>();
   const queue: string[] = [tip];
-  while (queue.length) {
-    const oid = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = lookup(oid);
@@ -580,14 +583,36 @@ export function readPack(
 
 /**
  * Inflate the zlib stream starting at `offset` and report how many bytes it
- * consumed. `inflateSync` ignores trailing bytes but throws on a truncated
- * stream, so the predicate "prefix inflates" is monotonic in the prefix
- * length and a binary search finds the exact stream end in O(log n) probes.
+ * consumed. One `inflateSync` over the tail is enough: with `{ info: true }`
+ * the engine reports how many input bytes the stream consumed
+ * (`bytesWritten`), so the stream end is known without probing. A result
+ * that does not look like a consumed prefix falls back to the binary search
+ * below, so a Node build that ever reports the count differently still reads
+ * packs correctly (just slower).
  */
 export function inflateAt(buf: Buffer, offset: number): { data: Buffer; consumed: number } {
-  // Fast path: most pack objects here compress to a few hundred bytes, so
-  // probe a 256-byte window first and binary-search inside it. Large streams
-  // fall back to a binary search over the whole tail.
+  try {
+    const result = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine?: { bytesWritten?: unknown };
+    };
+    const consumed = result.engine?.bytesWritten;
+    if (
+      typeof consumed === 'number' &&
+      Number.isInteger(consumed) &&
+      consumed > 0 &&
+      offset + consumed <= buf.length &&
+      result.buffer.length >= 0
+    ) {
+      return { data: result.buffer, consumed };
+    }
+  } catch {
+    // The stream is truncated or malformed: the search below throws the
+    // precise error for it.
+  }
+  // Fallback: `inflateSync` ignores trailing bytes but throws on a truncated
+  // stream, so the predicate "prefix inflates" is monotonic in the prefix
+  // length and a binary search finds the exact stream end in O(log n) probes.
   const tryEnd = Math.min(buf.length, offset + 256);
   try {
     inflateSync(buf.subarray(offset, tryEnd));
